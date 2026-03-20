@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""
+SignLink Preview - Hand + Pose Model (98% accuracy!)
+Test your trained model with pose features locally.
+
+Signs: brother, family, father, friend, hello, mother, school, teacher, tired, yes
+"""
+
+import json
+import os
+import sys
+from pathlib import Path
+
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+
+import cv2
+import numpy as np
+from collections import deque, Counter
+
+import torch
+
+from src.features_hands_pose import HandsPoseFeatureExtractor
+from src.overlay import draw_caption, draw_status
+from src.model import SignGRU
+
+
+def softmax_np(x: np.ndarray):
+    e = np.exp(x - np.max(x))
+    return e / (e.sum() + 1e-9)
+
+
+def main():
+    print("=" * 70)
+    print("SIGNLINK PREVIEW - Pose Enhanced Model (98% accuracy)")
+    print("=" * 70)
+    print("Signs: brother, family, father, friend, hello,")
+    print("       mother, school, teacher, tired, yes")
+    print("=" * 70)
+
+    # Configuration
+    camera_index = 0
+    width = 1280
+    height = 720
+    T = 60  # Window size for inference
+
+    # Camera setup
+    print(f"\nOpening camera {camera_index}...")
+    cap = cv2.VideoCapture(camera_index)
+
+    if not cap.isOpened():
+        print(f"ERROR: Could not open camera {camera_index}")
+        return
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+    actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
+
+    print(f"Camera opened: {actual_width}x{actual_height} @ {fps}fps")
+
+    # Initialize feature extractor with POSE
+    print("Initializing Hand+Pose extractor...")
+    extractor = HandsPoseFeatureExtractor()
+
+    # Device selection
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    # Load pose model
+    labels_path = os.path.join("models_pose", "pose_labels.json")
+    ckpt_path = os.path.join("models_pose", "pose_gru.pt")
+    config_path = os.path.join("models_pose", "pose_config.json")
+
+    if os.path.exists(labels_path) and os.path.exists(ckpt_path):
+        with open(labels_path, "r") as f:
+            labels = json.load(f)
+
+        # Load config if available
+        input_size = 156  # Default for pose features
+        if os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                config = json.load(f)
+                input_size = config.get("input_size", 156)
+
+        model = SignGRU(
+            input_size=input_size,
+            hidden_size=128,
+            num_layers=2,
+            num_classes=len(labels),
+            dropout=0.2
+        )
+        model.load_state_dict(torch.load(ckpt_path, map_location=device))
+        model.to(device)
+        model.eval()
+
+        print(f"\nPose model loaded: {len(labels)} signs, {input_size} features")
+        print(f"Labels: {labels}")
+    else:
+        model = None
+        labels = []
+        print(f"\nWARNING: Pose model not found!")
+        print(f"Expected: {ckpt_path}")
+        print("Run: modal run scripts/modal_train_pose.py")
+
+    # State variables
+    window = deque(maxlen=T)
+    pred_hist = deque(maxlen=15)
+    conf_hist = deque(maxlen=15)
+
+    frozen = False
+    frame_i = 0
+
+    HOLD_N = 60
+    MIN_PREDICTIONS = 6
+    HAND_EXIT_CONFIRM_FRAMES = 10
+    stride_live = 2
+
+    current_state = "WAITING"
+    hands_gone_frames = 0
+    best_candidate_conf = 0.0
+
+    display_caption = ""
+    display_conf = None
+    hold_frames = 0
+
+    def commit(label: str, conf: float):
+        nonlocal display_caption, display_conf, hold_frames
+        display_caption = label
+        display_conf = conf
+        hold_frames = HOLD_N
+        print(f"SHOWING: '{label}' (confidence: {conf:.2f})")
+
+    debug_line = ""
+    gesture_count = 0
+
+    print()
+    print("=" * 70)
+    print("READY! This model has 98% accuracy.")
+    print("=" * 70)
+    print()
+    print("Controls: q=quit, c=clear, SPACE=freeze")
+    print()
+    print("Signs to try:")
+    for i, label in enumerate(labels):
+        print(f"  {i+1:2d}. {label}")
+    print("=" * 70 + "\n")
+
+    # Main loop
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+
+            frame = cv2.flip(frame, 1)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            feat, info = extractor.extract(rgb)
+            window.append(feat)
+
+            left = int(info["left_present"])
+            right = int(info["right_present"])
+            pose = int(info["pose_present"])
+            hands_detected = (left > 0 or right > 0)
+            hands_state = f"L={left} R={right} P={pose}"
+
+            if not hands_detected:
+                hands_gone_frames += 1
+            else:
+                hands_gone_frames = 0
+
+            # State machine
+            if current_state == "WAITING":
+                if hands_detected:
+                    current_state = "COLLECTING"
+                    gesture_count += 1
+                    pred_hist.clear()
+                    conf_hist.clear()
+                    best_candidate_conf = 0.0
+                    display_caption = ""
+                    display_conf = None
+                    hold_frames = 0
+                    print(f"\nGESTURE {gesture_count} STARTED")
+
+            elif current_state == "COLLECTING":
+                if not hands_detected and hands_gone_frames >= HAND_EXIT_CONFIRM_FRAMES:
+                    if len(pred_hist) >= MIN_PREDICTIONS:
+                        vote_counts = Counter(pred_hist)
+                        most_common = vote_counts.most_common(1)[0]
+                        vote_label_idx, _ = most_common
+
+                        label_confs = [c for p, c in zip(pred_hist, conf_hist) if p == vote_label_idx]
+                        avg_conf = sum(label_confs) / len(label_confs) if label_confs else 0.0
+
+                        predicted_label = labels[vote_label_idx]
+                        commit(predicted_label, avg_conf)
+                        current_state = "SHOWING"
+                        print(f"GESTURE {gesture_count} -> '{predicted_label}' ({avg_conf:.2f})")
+                    else:
+                        print(f"Not enough predictions ({len(pred_hist)})")
+                        current_state = "WAITING"
+
+            elif current_state == "SHOWING":
+                if hands_detected:
+                    current_state = "COLLECTING"
+                    gesture_count += 1
+                    pred_hist.clear()
+                    conf_hist.clear()
+                    best_candidate_conf = 0.0
+                    display_caption = ""
+                    display_conf = None
+                    hold_frames = 0
+                    print(f"\nGESTURE {gesture_count} STARTED")
+
+            # Inference
+            if current_state == "COLLECTING" and (not frozen) and (model is not None):
+                if (len(window) == T) and (frame_i % stride_live == 0):
+                    x = np.stack(window, axis=0).astype(np.float32)
+                    xt = torch.from_numpy(x).unsqueeze(0).to(device)
+                    with torch.no_grad():
+                        logits = model(xt).cpu().numpy()[0]
+                    probs = softmax_np(logits)
+                    pred = int(np.argmax(probs))
+                    pred_conf = float(probs[pred])
+
+                    pred_hist.append(pred)
+                    conf_hist.append(pred_conf)
+
+                    debug_line = f"{labels[pred]} ({pred_conf:.2f})"
+
+                if len(pred_hist) >= MIN_PREDICTIONS:
+                    vote_counts = Counter(pred_hist)
+                    most_common = vote_counts.most_common(1)[0]
+                    vote_label_idx, _ = most_common
+
+                    label_confs = [c for p, c in zip(pred_hist, conf_hist) if p == vote_label_idx]
+                    avg_conf = sum(label_confs) / len(label_confs) if label_confs else 0.0
+
+                    if avg_conf > best_candidate_conf:
+                        best_candidate_conf = avg_conf
+
+            # Display
+            if hold_frames > 0:
+                hold_frames -= 1
+                if hold_frames == 0:
+                    current_state = "WAITING"
+                    display_caption = ""
+                    display_conf = None
+                    print("Caption cleared\n")
+
+            if current_state == "SHOWING" and hold_frames > 0:
+                caption_to_display = display_caption
+                conf_to_display = display_conf
+            else:
+                caption_to_display = ""
+                conf_to_display = None
+                if current_state == "WAITING":
+                    debug_line = ""
+
+            if model is None:
+                caption_to_display = "No model loaded"
+                conf_to_display = None
+
+            # Draw
+            status_line = (
+                hands_state +
+                (" | FROZEN" if frozen else "") +
+                (f" | {debug_line}" if debug_line else "") +
+                f" | {current_state}"
+            )
+
+            draw_status(frame, status_line)
+            draw_caption(frame, caption_to_display, conf_to_display)
+
+            h, w = frame.shape[:2]
+            if current_state == "WAITING":
+                cv2.rectangle(frame, (0, 0), (w-1, h-1), (128, 128, 128), 6)
+            elif current_state == "COLLECTING":
+                cv2.rectangle(frame, (0, 0), (w-1, h-1), (0, 255, 0), 6)
+            else:
+                cv2.rectangle(frame, (0, 0), (w-1, h-1), (255, 0, 0), 6)
+
+            cv2.imshow("SignLink Pose Model Preview (Press Q to quit)", frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print(f"\n{'='*70}")
+                print(f"Session ended - Total gestures: {gesture_count}")
+                print(f"{'='*70}\n")
+                break
+            elif key == ord('c'):
+                pred_hist.clear()
+                conf_hist.clear()
+                display_caption = ""
+                display_conf = None
+                hold_frames = 0
+                current_state = "WAITING"
+                best_candidate_conf = 0.0
+                hands_gone_frames = 0
+                debug_line = ""
+                print("State cleared\n")
+            elif key == ord(' '):
+                frozen = not frozen
+                print(f"Frozen: {frozen}")
+
+            frame_i += 1
+
+    except KeyboardInterrupt:
+        print("\n\nStopping...")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        print("Preview stopped\n")
+
+
+if __name__ == "__main__":
+    main()
